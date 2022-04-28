@@ -1,7 +1,3 @@
-from ast import arg
-import imp
-from numpy import append
-from rsa import compute_hash
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -21,51 +17,66 @@ def inference(device, args):
     """
     Load the model, initialize DDP, and run inference.
     """
-    WORLD_SIZE = int(os.environ['WORLD_SIZE'])
-    NODE_RANK = int(os.environ['NODE_RANK'])
-    RANK = NODE_RANK * torch.cuda.device_count() + device
+    num_workers = args.num_workers
+    batch_size = args.batch_size
+    output_num_samples = args.output_num_samples
+    output_columns = args.output_columns
 
+
+    no_of_available_devices = torch.cuda.device_count()
     model, transforms = load_model(device)
-    fs, output_folder = fsspec.core.url_to_fs(args.bucket_dir,
-        client_kwargs={"endpoint_url":"https://bucket.vpce-06aadfc9fc5aabd58-bv32itci.s3.us-east-1.vpce.amazonaws.com/"})
-    output_folder += '/'
+    if args.bucket_dir is None:
+        output_folder = args.output_dir
+        file_handler = open
+        os.makedirs(output_folder, exist_ok=True)
+    else:
+        fs, output_folder = fsspec.core.url_to_fs(args.bucket_dir,
+            client_kwargs={"endpoint_url":"https://bucket.vpce-06aadfc9fc5aabd58-bv32itci.s3.us-east-1.vpce.amazonaws.com/"})
+        output_folder += "/"
+        file_handler = fs.open
+    
 
-    # Get webdataset
-    urls = list(braceexpand(args.urls))[RANK::WORLD_SIZE]
+
+    all_urls = list(braceexpand(args.urls))
+    # slice URLs to be sharded when multiple devices are being used. Ex: When there are two GPUs available [0,2,4...] urls will be processed on device 0 and [1,3,5..] urls on device 1 
+    urls = all_urls[device::no_of_available_devices]
     dataset = create_webdataset(
         urls,
         transforms,
         enable_metadata=True,
-    ).batch(args.batch_size)
-    dataloader = wds.WebLoader(
-        dataset, batch_size=None, shuffle=False, num_workers=8, collate_fn=collate
     )
-    dataloader.num_batches = args.num_samples // (WORLD_SIZE * args.batch_size)
-    dataloader.num_samples = dataloader.num_batches * (WORLD_SIZE * args.batch_size)
+    dataloader = wds.WebLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate
+    )
 
     # Run inference
     current_samples = []
     if device == 0:
-        pbar = tqdm(total=dataloader.num_samples)
-    for batch in dataloader:
+        pbar = tqdm(total=args.num_samples)
+
+    additional_columns = additional_columns_to_include(args)
+    output_metadata_columns = ["pwatermark"] + additional_columns
+    
+    for batch in tqdm(dataloader, desc="processing.."):
         img = batch['image_tensor'].to(device)
+        start = perf_counter()
         with torch.no_grad():
             out = model(img)
             out = torch.nn.functional.softmax(out, dim=1)
-        current_samples.extend(statistics_to_array(out, batch))
-
+        current_samples.extend(statistics_to_array(out, batch, additional_columns))
         # Save current samples to parquet
-        if len(current_samples) >= int(1e5):  
-            df = pd.DataFrame(current_samples, columns=['pwatermark', 'hash'])
+        if len(current_samples) >= output_num_samples:
+            df = pd.DataFrame(current_samples, columns=output_metadata_columns)
             df['pwatermark'] = df['pwatermark'].astype("float32")
-            with fs.open(os.path.join(output_folder, str(uuid.uuid4())) + '.parquet', 'wb') as f:
+            with file_handler(os.path.join(output_folder, str(uuid.uuid4())) + '.parquet', 'wb') as f:
                 df.to_parquet(f)
-            current_samples = []            
-        if device == 0:
-            pbar.update(WORLD_SIZE * args.batch_size)
-    df = pd.DataFrame(current_samples, columns=['pwatermark', 'hash'])
+            current_samples = []
+    if device == 0:
+        pbar.update(no_of_available_devices * args.batch_size)
+        # aproximage pbar update? assuming that the other othe devices are processing batches at same speed as device 0
+    df = pd.DataFrame(current_samples, columns=output_metadata_columns)
     df['pwatermark'] = df['pwatermark'].astype("float32")
-    with fs.open(os.path.join(output_folder, str(uuid.uuid4())) + '.parquet', 'wb') as f:
+    with file_handler(os.path.join(output_folder, str(uuid.uuid4())) + '.parquet', 'wb') as f:
         df.to_parquet(f)
     if device == 0:
         pbar.close()
@@ -92,7 +103,10 @@ def load_model(device):
     )
 
     # Load model weights
-    state_dict = torch.load('./model.pt')['weights']
+    state_dict = torch.load('./model.pt',
+        map_location=torch.device(f"cuda:{device}")
+    )['weights']
+    
     model.load_state_dict(state_dict)
     model.eval().to(device)
 
@@ -108,13 +122,20 @@ def collate(arr):
     
     return ret_dict
 
-def statistics_to_array(out, batch):
+def statistics_to_array(out, batch, columns):
     output = []
-    for i in range(len(batch['image_tensor'])):
-        output.append([
-            out[i][0].item(),
-            compute_hash(json.loads(batch['metadata'][i]).get('url'), batch['text'][i])
-        ])
+    for i in range(out.shape[0]):
+        row = [out[i][0].item(), batch['image_path'][i]]
+        # for c in columns:
+        #     if c in batch:
+        #         row.append(batch[c][i])
+        #     else:
+        #         json_meta = json.loads(batch['metadata'][i])
+        #         if c in json_meta:
+        #             row.append(json_meta[c])
+        #         else:
+        #             row.append(None)
+        output.append(row)
     return output
 
 def compute_hash(url, text):
@@ -126,3 +147,10 @@ def compute_hash(url, text):
   
   total = (url + text).encode("utf-8")
   return mmh3.hash64(total)[0]
+
+def additional_columns_to_include(args):
+    columns = ["image_path"]
+    return columns
+    # c = set(args.output_columns)
+    # columns += list(c)
+    # return columns

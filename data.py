@@ -34,7 +34,7 @@ def preprocess_dataset(
         image_data = item[image_key]
         image = Image.open(io.BytesIO(image_data))
         image_tensor = image_transform(image)
-        output["image_filename"] = item["__key__"]
+        output["__key__"] = item["__key__"]
         output["image_tensor"] = image_tensor
 
     if enable_text:
